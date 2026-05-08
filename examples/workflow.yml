@@ -1,0 +1,52 @@
+# このファイルを論文リポジトリの .github/workflows/review.yml としてコピーして使用してください。
+# シークレットは論文リポジトリの Settings > Secrets and variables > Actions に設定してください：
+#   - OVERLEAF_TOKEN       : Overleaf の Git アクセストークン
+#   - OVERLEAF_PROJECT_ID  : Overleaf プロジェクト ID
+
+name: Overleaf Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_mode:
+        description: 'ブランチ選択 — new: 新規作成, existing: 既存'
+        required: true
+        type: choice
+        options:
+          - new
+          - existing
+        default: new
+      branch_name:
+        description: '新規ブランチ名・英数字/ハイフンのみ（空白で日時自動生成）'
+        required: false
+        type: string
+        default: ''
+      review_stage:
+        description: 'レビューの段階 — structure: 構成・ロジック / proofread: 表現・誤字脱字 / final: 最終チェック（全部）'
+        required: true
+        type: choice
+        options:
+          - structure
+          - proofread
+          - final
+        default: structure
+      review_mode:
+        description: 'レビュー範囲 — diff_only: 前回との差分 / full_review: 全体'
+        required: true
+        type: choice
+        options:
+          - diff_only
+          - full_review
+        default: diff_only
+
+jobs:
+  review:
+    uses: tdufi-idl/OverleafReviewer/.github/workflows/sync.yaml@main
+    with:
+      branch_mode: ${{ inputs.branch_mode }}
+      branch_name: ${{ inputs.branch_name }}
+      review_stage: ${{ inputs.review_stage }}
+      review_mode: ${{ inputs.review_mode }}
+    secrets:
+      OVERLEAF_TOKEN: ${{ secrets.OVERLEAF_TOKEN }}
+      OVERLEAF_PROJECT_ID: ${{ secrets.OVERLEAF_PROJECT_ID }}

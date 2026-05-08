@@ -1,0 +1,409 @@
+name: Overleaf Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_mode:
+        description: 'ブランチ選択 — new: 新規作成, existing: 既存'
+        required: true
+        type: choice
+        options:
+          - new
+          - existing
+        default: new
+      branch_name:
+        description: '新規ブランチ名・英数字/ハイフンのみ（空白で日時自動生成）'
+        required: false
+        type: string
+        default: ''
+      review_stage:
+        description: 'レビューの段階 — structure: 構成・ロジック / proofread: 表現・誤字脱字 / final: 最終チェック（全部）'
+        required: true
+        type: choice
+        options:
+          - structure
+          - proofread
+          - final
+        default: structure
+      review_mode:
+        description: 'レビュー範囲 — diff_only: 前回との差分 / full_review: 全体'
+        required: true
+        type: choice
+        options:
+          - diff_only
+          - full_review
+        default: diff_only
+
+  # 他リポジトリから呼び出すためのトリガー
+  workflow_call:
+    inputs:
+      branch_mode:
+        description: 'ブランチ選択 — existing: 既存, new: 新規作成'
+        required: true
+        type: string
+      branch_name:
+        description: '新規ブランチ名（空白で日時自動生成）'
+        required: false
+        type: string
+        default: ''
+      review_stage:
+        description: 'レビューの段階 — structure / proofread / final'
+        required: true
+        type: string
+      review_mode:
+        description: 'レビュー範囲 — diff_only / full_review'
+        required: true
+        type: string
+    secrets:
+      OVERLEAF_TOKEN:
+        required: true
+      OVERLEAF_PROJECT_ID:
+        required: true
+
+jobs:
+  sync:
+    runs-on: self-hosted
+    permissions:
+      contents: write       # ブランチ作成・push
+      pull-requests: write  # PR作成・コメント・approve
+
+    steps:
+    # リポジトリ全履歴を取得
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    # プロンプトファイルをテンプレートリポジトリから取得（_template/）
+    - name: Checkout template repo for prompts
+      uses: actions/checkout@v4
+      with:
+        repository: IDL-lab-team/OverleafReviewerTemplate
+        path: _template
+
+    # - new: 指定名または review/年月日時分 で新規作成
+    # - existing: workflow_fromで選んだブランチ
+    - name: Set up branch - ブランチの作成/特定
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        if [ "${{ inputs.branch_mode }}" = "new" ]; then
+          BRANCH="${{ inputs.branch_name }}"
+          # 空白、または日本語（マルチバイト文字）が含まれていたら日時名で自動生成
+          if [ -z "$BRANCH" ] || echo "$BRANCH" | grep -qP '[^\x00-\x7F]'; then
+            BRANCH="review/$(TZ=Asia/Tokyo date +%Y-%m-%d-%H%M)"
+          fi
+          git checkout -b "$BRANCH"
+        else
+          BRANCH="${GITHUB_REF_NAME}"
+          if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+            echo "Error: branch_mode=existing ではmain/masterブランチは指定できません。branch_mode=new を使ってください。" >&2
+            exit 1
+          fi
+          git checkout "$BRANCH"
+        fi
+
+        echo "TARGET_BRANCH=$BRANCH" >> "$GITHUB_ENV"
+        echo "Using branch: $BRANCH"
+
+    - name: Pull from Overleaf - Overleafの変更を取り込み
+      env:
+        OVERLEAF_TOKEN: ${{ secrets.OVERLEAF_TOKEN }}
+        OVERLEAF_PROJECT_ID: ${{ secrets.OVERLEAF_PROJECT_ID }}
+      run: |
+        git config pull.rebase false
+        git pull https://git:${OVERLEAF_TOKEN}@git.overleaf.com/${OVERLEAF_PROJECT_ID} master
+
+    - name: Push to GitHub - GitHubに反映
+      run: |
+        git push origin "$TARGET_BRANCH" --set-upstream
+
+    # Overleafからの変更がない場合: 新規ブランチは削除、既存ブランチはレビューをスキップ
+    - name: Check for diff - 差分確認・空ブランチ削除
+      run: |
+        AHEAD=$(git rev-list --count origin/master..HEAD)
+        if [ "$AHEAD" -eq 0 ]; then
+          echo "BRANCH_NO_DIFF=true" >> "$GITHUB_ENV"
+          echo "SKIP_REVIEW=true" >> "$GITHUB_ENV"
+          if [ "${{ inputs.branch_mode }}" = "new" ]; then
+            git push origin --delete "$TARGET_BRANCH"
+            echo "差分なし: 空の新規ブランチを削除しました ($TARGET_BRANCH)"
+          else
+            echo "差分なし: 既存ブランチのためレビューをスキップします"
+          fi
+        fi
+
+    # 対象ブランチのPRが存在しなければ新規作成、あればタイトルと概要を更新
+    # レビュー段階と範囲をPRに記録しておく
+    - name: Create or update PR - PRの作成または更新
+      if: env.BRANCH_NO_DIFF != 'true'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        PR_NUMBER=$(gh pr list \
+          --head "$TARGET_BRANCH" \
+          --base master \
+          --state open \
+          --json number \
+          --jq '.[0].number // empty')
+
+        PR_BODY="## Review Info
+        | 項目 | 値 |
+        |------|-----|
+        | レビュー段階 | \`${{ inputs.review_stage }}\` |
+        | レビュー範囲 | \`${{ inputs.review_mode }}\` |"
+
+        if [ -z "$PR_NUMBER" ]; then
+          gh pr create \
+            --base master \
+            --head "$TARGET_BRANCH" \
+            --title "[${{ inputs.review_stage }}] $TARGET_BRANCH" \
+            --body "$PR_BODY"
+          echo "PR created"
+        else
+          gh pr edit "$PR_NUMBER" \
+            --title "[${{ inputs.review_stage }}] $TARGET_BRANCH" \
+            --body "$PR_BODY"
+          echo "PR updated (#$PR_NUMBER)"
+        fi
+
+    # レビューに渡すテキストを/tmp/review_content.txtに書き出す（対象はmain.texのみ）
+    # diff_only: diffの各行に新ファイルの行番号 [L<n>] を付与
+    # full_review: nl -ba で行番号付きの全文
+    - name: Prepare review content - レビュー対象テキストの準備
+      if: env.BRANCH_NO_DIFF != 'true'
+      run: |
+        if [ "${{ inputs.review_mode }}" = "diff_only" ]; then
+          if git rev-parse --verify last-review >/dev/null 2>&1; then
+            DIFF_BASE="last-review"
+          else
+            DIFF_BASE="origin/master"
+          fi
+          echo "DIFF_BASE=$DIFF_BASE" >> "$GITHUB_ENV"
+          git diff ${DIFF_BASE}..HEAD -- main.tex > /tmp/raw_diff.txt
+          if [ ! -s /tmp/raw_diff.txt ]; then
+            echo '{"summary":"(main.texに差分なし)","comments":[],"approved":false}' > /tmp/review_result.txt
+            echo "SKIP_REVIEW=true" >> "$GITHUB_ENV"
+          else
+            python3 - <<'PYEOF'
+        import re
+        with open('/tmp/raw_diff.txt') as f:
+            lines = f.read().splitlines()
+        output = []
+        new_line = 0
+        for line in lines:
+            if line.startswith('@@'):
+                m = re.search(r'\+(\d+)', line)
+                if m:
+                    new_line = int(m.group(1)) - 1
+                output.append(line)
+            elif line.startswith('+++') or line.startswith('---'):
+                output.append(line)
+            elif line.startswith('+'):
+                new_line += 1
+                output.append(f'[L{new_line}]{line}')
+            elif line.startswith(' '):
+                new_line += 1
+                output.append(f'[L{new_line}]{line}')
+            elif line.startswith('-'):
+                output.append(line)
+            else:
+                output.append(line)
+        with open('/tmp/review_content.txt', 'w') as f:
+            f.write('\n'.join(output))
+        PYEOF
+          fi
+        else
+          nl -ba main.tex > /tmp/review_content.txt
+        fi
+ 
+    # _template/prompts/ の3ファイル（共通+段階+範囲）を結合してプロンプトを組み立て
+    # レスポンスのJSONから approved フィールドを読んでCLAUDE_APPROVED=trueを環境変数にセット
+    - name: Run Claude review - レビュー開始
+      if: env.SKIP_REVIEW != 'true'
+      env:
+        REVIEW_STAGE: ${{ inputs.review_stage }}
+        REVIEW_MODE: ${{ inputs.review_mode }}
+      run: |
+        python3 - <<'PYEOF'
+        import os, re, json, subprocess
+
+        stage = os.environ['REVIEW_STAGE']
+        mode  = os.environ['REVIEW_MODE']
+
+        with open('_template/prompts/common.txt')      as f: common  = f.read()
+        with open(f'_template/prompts/{stage}.txt')    as f: stage_p = f.read()
+        with open(f'_template/prompts/{mode}.txt')     as f: mode_p  = f.read()
+        with open('/tmp/review_content.txt')           as f: content = f.read()
+
+        message = f"{common}\n\n{stage_p}\n\n{mode_p}\n\n---\n\n{content}"
+        CLAUDE_BIN = "/home/runner/.local/bin/claude"
+        result = subprocess.run(
+            [CLAUDE_BIN, '-p', message],
+            capture_output=True, text=True, check=True
+        )
+        text = result.stdout
+
+        # マークダウンコードブロックや余分なテキストを除去してJSONオブジェクトを抽出
+        m = re.search(r'\{[\s\S]*\}', text)
+        if m:
+            text = m.group(0)
+        print(text)
+
+        with open('/tmp/review_result.txt', 'w') as f:
+            f.write(text)
+
+        try:
+            approved = json.loads(text).get("approved", False)
+        except Exception:
+            approved = "[APPROVED]" in text
+        if approved:
+            with open(os.environ["GITHUB_ENV"], "a") as f:
+                f.write("CLAUDE_APPROVED=true\n")
+        PYEOF
+
+    # レビュー結果をPRに投稿
+    # 行コメントはPR Reviews APIでインラインコメント、summaryは会話タブ
+    # APIエラー時（差分外の行など）は会話タブへのフォールバックコメントを投稿
+    - name: Post review comment - レビュー投稿
+      if: env.SKIP_REVIEW != 'true'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        PR_NUMBER=$(gh pr list \
+          --head "$TARGET_BRANCH" \
+          --base master \
+          --state open \
+          --json number \
+          --jq '.[0].number // empty')
+        if [ -n "$PR_NUMBER" ]; then
+          export PR_NUMBER
+          python3 - <<'PYEOF'
+        import json, os, subprocess, sys
+
+        with open('/tmp/review_result.txt') as f:
+            text = f.read()
+
+        pr_number = os.environ['PR_NUMBER']
+        repo = os.environ['GITHUB_REPOSITORY']
+
+        try:
+            data = json.loads(text)
+            summary = data.get('summary', text)
+            line_comments = data.get('comments', [])
+        except json.JSONDecodeError:
+            summary = text
+            line_comments = []
+
+        # サマリーをPRレビューとして投稿
+        subprocess.run(
+            ['gh', 'api', f'repos/{repo}/pulls/{pr_number}/reviews',
+             '--method', 'POST', '--input', '-'],
+            input=json.dumps({'body': summary, 'event': 'COMMENT', 'comments': []}).encode(),
+            check=True
+        )
+
+        if not line_comments:
+            sys.exit(0)
+
+        # PRのHEADコミットSHAを取得
+        commit_id = subprocess.run(
+            ['gh', 'pr', 'view', pr_number, '--json', 'headRefOid', '--jq', '.headRefOid'],
+            capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+        # 行コメントを1件ずつ投稿、差分外の行は failed リストへ
+        failed = []
+        for c in line_comments:
+            if 'line' not in c:
+                continue
+            payload = {
+                'body': c['body'],
+                'commit_id': commit_id,
+                'path': 'main.tex',
+                'line': c['line'],
+                'side': 'RIGHT'
+            }
+            if 'start_line' in c and c['start_line'] != c['line']:
+                payload['start_line'] = c['start_line']
+                payload['start_side'] = 'RIGHT'
+
+            r = subprocess.run(
+                ['gh', 'api', f'repos/{repo}/pulls/{pr_number}/comments',
+                 '--method', 'POST', '--input', '-'],
+                input=json.dumps(payload).encode(),
+                capture_output=True
+            )
+            if r.returncode != 0:
+                print(f"L{c['line']}: inline failed → {r.stderr.decode().strip()}", file=sys.stderr)
+                failed.append(c)
+
+        if failed:
+            fallback = '> 以下のコメントは差分外の行のためインラインで投稿できませんでした\n\n'
+            for c in failed:
+                if 'start_line' in c:
+                    fallback += f"**L{c['start_line']}–L{c['line']}**: {c['body']}\n\n"
+                else:
+                    fallback += f"**L{c['line']}**: {c['body']}\n\n"
+            subprocess.run(
+                ['gh', 'pr', 'comment', pr_number, '--body', fallback],
+                check=True
+            )
+        PYEOF
+        fi
+
+    # レビュー完了後に last-review タグを現在のHEADに更新
+    # 次回 diff_only 実行時のベースになる
+    - name: Update last-review tag
+      if: env.SKIP_REVIEW != 'true'
+      run: |
+        git tag -f last-review HEAD
+        git push origin last-review --force
+
+    # final+full_reviewかつClaudeが[APPROVED]の場合のみ承認通知コメントを投稿
+    - name: Post approval notice - 承認通知
+      if: env.CLAUDE_APPROVED == 'true' && inputs.review_stage == 'final' && inputs.review_mode == 'full_review'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        PR_NUMBER=$(gh pr list \
+          --head "$TARGET_BRANCH" \
+          --base master \
+          --state open \
+          --json number \
+          --jq '.[0].number // empty')
+        if [ -n "$PR_NUMBER" ]; then
+          gh pr comment "$PR_NUMBER" \
+            --body "✅ **APPROVED** — Claude による最終チェックで問題なしと判定されました。マージできます。"
+        fi
+
+    # 実行結果をActionsのSummaryページにまとめて表示
+    - name: Summary
+      run: |
+        echo "### Review Job Summary" >> "$GITHUB_STEP_SUMMARY"
+        echo "| 項目 | 値 |" >> "$GITHUB_STEP_SUMMARY"
+        echo "|------|-----|" >> "$GITHUB_STEP_SUMMARY"
+        if [ "${BRANCH_NO_DIFF}" = "true" ]; then
+          if [ "${{ inputs.branch_mode }}" = "new" ]; then
+            echo "| 結果 | 差分なし — 空の新規ブランチを削除しました |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| ブランチ | \`$TARGET_BRANCH\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| 結果 | 差分なし — レビューをスキップしました |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+        elif [ "${SKIP_REVIEW}" = "true" ]; then
+          echo "| ブランチ | \`$TARGET_BRANCH\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 結果 | main.texに差分なし — レビューをスキップしました |" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "| ブランチ | \`$TARGET_BRANCH\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| レビュー段階 | \`${{ inputs.review_stage }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| レビュー範囲 | \`${{ inputs.review_mode }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${DIFF_BASE}" ]; then
+            echo "| 差分ベース | \`${DIFF_BASE}\` |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "${CLAUDE_APPROVED}" = "true" ]; then
+            echo "| Claude判定 | APPROVED |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Claude判定 | NEEDS REVISION |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+        fi
