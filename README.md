@@ -1,7 +1,7 @@
 # OverleafPaperReviewer
 ## 概要
 オーバーリーフで作成した論文に対してclaudecodeが査読(レビュー)を行うためのGithubActions(by self-hosted runner)です。  
-本リポジトリのworkflowは論文リポジトリで実行するActionから呼び出されるものであり、本リポジトリのみで動作するものではありません。
+本workflowは論文リポジトリで実行するActionから呼び出されるものであり、本リポジトリのみで動作するものではありません。
 
 ## 使用方法
 - self-hosted runnerを起動しておく
