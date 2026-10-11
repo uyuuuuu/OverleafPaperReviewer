@@ -78,7 +78,7 @@ jobs:
     - name: Checkout template repo for prompts
       uses: actions/checkout@v4
       with:
-        repository: IDL-lab-team/OverleafReviewerTemplate
+        repository: tdufi-idl/OverleafReviewer
         path: _template
 
     # - new: 指定名または review/年月日時分 で新規作成
