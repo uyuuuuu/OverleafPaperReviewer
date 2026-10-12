@@ -15,7 +15,7 @@ on:
           - final
         default: structure
       review_mode:
-        description: 'レビュー範囲 — diff_only: 前回のレビューとの差分 / full_review: 全体'
+        description: 'レビュー範囲 — diff_only: 前回のレビューとの差分 / full_review: 全体（final のときは常に全体）'
         required: true
         type: choice
         options:
